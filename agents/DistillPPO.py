@@ -5,7 +5,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import wandb
 
-from common.env.env import make_env
+from common.env import make_env
 from common.trajectories import DistilledTrajectory
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -169,10 +169,10 @@ class DistillPPOAgent:
         self.student.train(False)
         self.teacher = DistilledArchitecture(obs_size).to(device)
         self.optimizer = optim.Adam(self.net.parameters(), lr = self.params.lr)
-        self.distillation_optimizer = optim.Adam(self.teacher.parameters(), lr = self.params.lr_distill)
-        self.trajectories = DistilledTrajectory(obs_size, self.params.n_steps, self.params.n_envs)
-        self.minimum_batch_size = params.min_batch_size
-        self.training_batch_size = params.batch_per_epoch
+        self.distillation_optimizer = optim.Adam(self.teacher.parameters(), lr = self.params.lr_distillation)
+        self.trajectories = DistilledTrajectory(obs_size, self.params.traj_steps, self.params.num_envs)
+        self.minimum_batch_size = params.minimum_batch_size
+        self.training_batch_size = params.epoch_batches
     
     
     def select_action(self, state, train=False):
@@ -248,7 +248,7 @@ class DistillPPOAgent:
     Training function
     '''
     def train(self, steps):
-        batch = self.params.n_envs * self.params.n_steps // self.minimum_batch_size
+        batch = self.params.num_envs * self.params.traj_steps // self.minimum_batch_size
         if batch < self.minimum_batch_size:
             self.minimum_batch_size = batch
         #Accumulate gradients for the batch
@@ -256,7 +256,7 @@ class DistillPPOAgent:
         gradient_steps = 1
 
         self.net.train()
-        for _ in range(self.params.ppo_epochs):
+        for _ in range(self.params.train_epochs):
             samples = self.trajectories.gather_experience(batch_size=batch, minimum_batch=self.minimum_batch_size)
 
             for sample in samples:
@@ -276,15 +276,15 @@ class DistillPPOAgent:
                 action_log_probabilities = action_distribution.log_prob(actions)
                 ratio = torch.exp(action_log_probabilities - old_action_log_probabilities)
                 unclipped_advantages = ratio * advantages
-                clipped_advantages = torch.clamp(ratio, 1.0 - self.params.ppo_eps, 1.0 + self.params.ppo_eps) * advantages
+                clipped_advantages = torch.clamp(ratio, 1.0 - self.params.epsilon, 1.0 + self.params.epsilon) * advantages
                 action_loss = -torch.min(unclipped_advantages, clipped_advantages).mean()
 
                 #Clipped Bellman-Error distilled
-                clipped_extrinsic_values = old_extrinsic_values + (extrinsic_values - old_extrinsic_values).clamp(-self.params.ppo_eps, self.params.ppo_eps)
-                clipped_intrinsic_values = old_intrinsic_values + (intrinsic_values - old_intrinsic_values).clamp(-self.params.ppo_eps, self.params.ppo_eps)
+                clipped_extrinsic_values = old_extrinsic_values + (extrinsic_values - old_extrinsic_values).clamp(-self.params.epsilon, self.params.epsilon)
+                clipped_intrinsic_values = old_intrinsic_values + (intrinsic_values - old_intrinsic_values).clamp(-self.params.epsilon, self.params.epsilon)
                 unclipped_values = (extrinsic_values - returns).pow(2) + (intrinsic_values - returns).pow(2)
                 clipped_values = (clipped_extrinsic_values - returns).pow(2) + (clipped_intrinsic_values - returns).pow(2)
-                value_loss = self.params.val_loss_coef * torch.max(unclipped_values, clipped_values).mean()
+                value_loss = self.params.val_coef * torch.max(unclipped_values, clipped_values).mean()
 
                 # distillation training
                 self.distillation_optimizer.zero_grad()
@@ -294,9 +294,9 @@ class DistillPPOAgent:
                 loss_distill.backward()
 
                 #Policy entropy
-                entropy_beta = max(0.01, self.params.entropy_beta * (1-steps/self.params.n_total_steps))
+                entropy_beta = max(0.01, self.params.entropy_beta * (1-steps/self.params.total_epochs))
                 entropy_loss = action_distribution.entropy().mean()
-                loss= (action_loss + (self.params.val_loss_coef * value_loss)) - (entropy_beta * entropy_loss)
+                loss= (action_loss + (self.params.val_coef * value_loss)) - (entropy_beta * entropy_loss)
                 loss.backward()
 
                 if gradient_steps % gradient_accumulation_steps == 0:
