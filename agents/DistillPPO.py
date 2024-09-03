@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import wandb
 
 from common.env import make_env
-from common.trajectories import DistilledTrajectory
+from common.trajectories import ExperienceBuffer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 '''
@@ -15,15 +15,15 @@ This should be done for the distilled network as well as the network to be disti
 and should yield better results than random initialization
 '''
 
-def xavier_inititalization(module, gain=1.0):
+def xavier_init(module, scaling=1.0):
     if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
-        nn.init.xavier_uniform_(module.weight.data, gain)
+        nn.init.xavier_uniform_(module.weight.data, scaling)
         nn.init.constant_(module.bias.data, 0)
     return module
 
-def orthogonal_initialization(module, gain=nn.init.calculate_gain('relu')):
+def orthogonal_init(module, scaling=nn.init.calculate_gain('relu')):
     if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
-        nn.init.orthogonal_(module.weight.data, gain)
+        nn.init.orthogonal_(module.weight.data, scaling)
         nn.init.constant_(module.bias.data, 0)
     return module
 
@@ -34,32 +34,32 @@ used instead of the standard Convolutional Layers
 that were previously used following A2C architecture
 '''
 
-class ResidualBlock(nn.Module):
-    def __init__(self, input_shape):
-        super(ResidualBlock, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(input_shape, input_shape, kernel_size=3, stride=1, padding=1),
+class SkipConnectionBlock(nn.Module):
+    def __init__(self, input_channels):
+        super(SkipConnectionBlock, self).__init__()
+        self.convolutional_block = nn.Sequential(
+            nn.Conv2d(input_channels, input_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.Conv2d(input_shape, input_shape, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(input_channels, input_channels, kernel_size=3, stride=1, padding=1),
         )
     
     def forward(self, x):
-        return x + self.conv(x)
-    
-class ImpalaBlock(nn.Module):
-    def __init__(self, input_shape, out_shape):
-        super(ImpalaBlock, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(input_shape, out_shape, kernel_size=3, stride=1, padding=1),
+        return x + self.convolutional_block(x)
+
+class FeatureExtractionBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(FeatureExtractionBlock, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            ResidualBlock(out_shape),
+            SkipConnectionBlock(out_channels),
             nn.ReLU(),
-            ResidualBlock(out_shape)
+            SkipConnectionBlock(out_channels)
         )
     
     def forward(self, x):
-        return self.conv(x)
+        return self.layers(x)
 
 ## Network to be distilled
 
@@ -70,36 +70,36 @@ Three Linear Layers.
 Same architecture for both the teacher and the student
 one more layer than the intrinsic critic in the PPO network
 '''
-class DistilledArchitecture(nn.Module):
+class KnowledgeDistillationNetwork(nn.Module):
     def __init__(self, input_shape):
-        super(DistilledArchitecture, self).__init__()
+        super(KnowledgeDistillationNetwork, self).__init__()
 
-        self.conv = nn.Sequential(
-            ImpalaBlock(input_shape[0], 16),
-            ImpalaBlock(16, 32),
+        self.convolutional_pipeline = nn.Sequential(
+            FeatureExtractionBlock(input_shape[0], 16),
+            FeatureExtractionBlock(16, 32),
             nn.ReLU(),
             nn.Flatten(),
             nn.Dropout(0.5)
         )
 
-        conv_out_size = self._get_conv_out(input_shape)
+        conv_output_size = self._compute_conv_output(input_shape)
 
-        self.ff = nn.Sequential(
-            nn.Linear(conv_out_size, 256),
+        self.fully_connected = nn.Sequential(
+            nn.Linear(conv_output_size, 256),
             nn.ReLU(),
             nn.Linear(256, 512),
             nn.ReLU(),
             nn.Linear(512, 1)
         )
 
-    def _get_conv_out(self, shape):
-        o = self.conv(torch.zeros(1, *shape))
-        return int(np.prod(o.size()))
+    def _compute_conv_output(self, shape):
+        output = self.convolutional_pipeline(torch.zeros(1, *shape))
+        return int(np.prod(output.size()))
     
     def forward(self, x):
-        fx = x.float()/256
-        conv_out = self.conv(fx).view(fx.size()[0],-1)
-        return self.ff(conv_out)
+        normalized_input = x.float() / 256
+        conv_out = self.convolutional_pipeline(normalized_input).view(normalized_input.size()[0], -1)
+        return self.fully_connected(conv_out)
     
 ## Distilled PPO Network
 '''
@@ -107,70 +107,68 @@ Main PPO Architecture, using two critics,
 one for environment rewards (extrinsic)
 and one from the teacher/student rewards (intrinsic)
 '''
-class PPONetwork(nn.Module):
+class PPOWithDistillation(nn.Module):
     
-    def __init__(self, obs_size, n_actions):
-        super(PPONetwork, self).__init__()
+    def __init__(self, obs_dims, n_actions):
+        super(PPOWithDistillation, self).__init__()
 
-        self.conv = nn.Sequential(
-            ImpalaBlock(obs_size[0], 16),
-            ImpalaBlock(16, 32),
+        self.convolution_pipeline = nn.Sequential(
+            FeatureExtractionBlock(obs_dims[0], 16),
+            FeatureExtractionBlock(16, 32),
             nn.ReLU(),
             nn.Flatten(),
             nn.Dropout(0.5)
         )
 
-        self.conv.apply(xavier_inititalization)
+        self.convolution_pipeline.apply(xavier_init)
 
-        conv_out_size = self._get_conv_out(obs_size)
+        conv_output_size = self._compute_conv_output(obs_dims)
 
-
-        self.actor = nn.Sequential(
-            nn.Linear(conv_out_size, 256),
+        self.actor_head = nn.Sequential(
+            nn.Linear(conv_output_size, 256),
             nn.ReLU(),
             nn.Linear(256, 512),
             nn.ReLU(),
             nn.Linear(512, n_actions)
         )
 
-
-        self.critic_ext = nn.Sequential(
-            nn.Linear(conv_out_size, 256),
+        self.critic_extrinsic = nn.Sequential(
+            nn.Linear(conv_output_size, 256),
             nn.Linear(256, 512),
             nn.ReLU(),
             nn.Linear(512, 1)
         )
 
-        self.critic_int = nn.Sequential(
-            nn.Linear(conv_out_size, 256),
+        self.critic_intrinsic = nn.Sequential(
+            nn.Linear(conv_output_size, 256),
             nn.ReLU(),
             nn.Linear(256, 1)
         )
     
-        self.actor.apply(orthogonal_initialization)
-        self.critic_ext.apply(orthogonal_initialization)
-        self.critic_int.apply(orthogonal_initialization)
+        self.actor_head.apply(orthogonal_init)
+        self.critic_extrinsic.apply(orthogonal_init)
+        self.critic_intrinsic.apply(orthogonal_init)
         
-    def _get_conv_out(self, shape):
-        o = self.conv(torch.zeros(1, *shape))
-        return int(np.prod(o.size()))
+    def _compute_conv_output(self, shape):
+        output = self.convolution_pipeline(torch.zeros(1, *shape))
+        return int(np.prod(output.size()))
     
     def forward(self, x):
-        fx = x.float()/256
-        conv_out = self.conv(fx).view(fx.size()[0],-1)
-        return self.actor(conv_out), self.critic_ext(conv_out), self.critic_int(conv_out)
+        normalized_input = x.float() / 256
+        conv_output = self.convolution_pipeline(normalized_input).view(normalized_input.size()[0], -1)
+        return self.actor_head(conv_output), self.critic_extrinsic(conv_output), self.critic_intrinsic(conv_output)
     
 # Distilled PPO Agent
 class DistillPPOAgent:
     def __init__(self, obs_size, action_size, params):
         self.params = params
-        self.net = PPONetwork(obs_size, action_size).to(device)
-        self.student = DistilledArchitecture(obs_size).to(device)
+        self.net = PPOWithDistillation(obs_size, action_size).to(device)
+        self.student = KnowledgeDistillationNetwork(obs_size).to(device)
         self.student.train(False)
-        self.teacher = DistilledArchitecture(obs_size).to(device)
+        self.teacher = KnowledgeDistillationNetwork(obs_size).to(device)
         self.optimizer = optim.Adam(self.net.parameters(), lr = self.params.lr)
         self.distillation_optimizer = optim.Adam(self.teacher.parameters(), lr = self.params.lr_distillation)
-        self.trajectories = DistilledTrajectory(obs_size, self.params.traj_steps, self.params.num_envs)
+        self.trajectories = ExperienceBuffer(obs_size, self.params.traj_steps, self.params.num_envs)
         self.minimum_batch_size = params.minimum_batch_size
         self.training_batch_size = params.epoch_batches
     
@@ -257,7 +255,7 @@ class DistillPPOAgent:
 
         self.net.train()
         for _ in range(self.params.train_epochs):
-            samples = self.trajectories.gather_experience(batch_size=batch, minimum_batch=self.minimum_batch_size)
+            samples = self.trajectories.sample_experiences(batch_size=batch, minimum_batch=self.minimum_batch_size)
 
             for sample in samples:
                 observations, actions, old_extrinsic_values, old_intrinsic_values, returns, advantages, old_action_log_probabilities = sample

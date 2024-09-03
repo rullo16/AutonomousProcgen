@@ -12,7 +12,7 @@ from gym3.internal.renderer import Renderer
 
 
 """
-Copy-pasted from OpenAI to obviate dependency on Baselines. Required for vectorized environments.
+Copied from OpenAI Baselines
 """
 
 class AlreadySteppingError(Exception):

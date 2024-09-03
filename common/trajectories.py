@@ -1,101 +1,147 @@
 import torch
 import numpy as np
-from collections import deque
-from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
+from torch.utils.data import BatchSampler, SubsetRandomSampler
 
-class DistilledTrajectory:
+class ExperienceBuffer:
 
-    def __init__(self, obs_shape, num_steps, num_envs):
+    def __init__(self, observation_dimensions, max_steps, num_simulations):
+        """
+        Initializes the experience buffer for storing simulation data over multiple steps.
+        
+        Args:
+            observation_dimensions (tuple): Dimensions of each observation per environment.
+            max_steps (int): Maximum number of steps per trajectory.
+            num_simulations (int): Number of parallel simulation environments.
+        """
+        self.obs_dims = observation_dimensions
+        self.total_steps = max_steps
+        self.sim_count = num_simulations
+        
+        # Buffers to hold simulation data
+        self.obs_memory = torch.zeros(self.total_steps + 1, self.sim_count, *self.obs_dims)
+        self.action_memory = torch.zeros(self.total_steps, self.sim_count)
+        self.reward_split = torch.zeros(self.total_steps, 2, self.sim_count)  # Splitting internal and external rewards
+        self.accumulated_rewards = torch.zeros(self.total_steps, self.sim_count)
+        self.termination_flags = torch.zeros(self.total_steps, self.sim_count)
+        self.action_log_probs = torch.zeros(self.total_steps, self.sim_count)
+        self.ext_value_estimations = torch.zeros(self.total_steps + 1, self.sim_count)
+        self.int_value_estimations = torch.zeros(self.total_steps + 1, self.sim_count)
+        self.future_returns = torch.zeros(self.total_steps, self.sim_count)
+        self.adv_estimations = torch.zeros(self.total_steps, self.sim_count)
+        self.int_ref_vals = torch.zeros(self.total_steps, self.sim_count)
+        self.ext_ref_vals = torch.zeros(self.total_steps, self.sim_count)
 
-        self.observation_shape = obs_shape
-        self.collection_steps = num_steps
-        self.num_environments = num_envs
-        self.observations = torch.zeros(self.collection_steps + 1, self.num_environments, *self.observation_shape)
-        self.actions = torch.zeros(self.collection_steps, self.num_environments)
-        self.ext_int_rewards = torch.zeros(self.collection_steps,2,self.num_environments)
-        self.combined_ext_int_rewards = torch.zeros(self.collection_steps, self.num_environments)
-        self.dones = torch.zeros(self.collection_steps, self.num_environments)
-        self.action_log_probabilities = torch.zeros(self.collection_steps, self.num_environments)
-        self.extrinsic_values = torch.zeros(self.collection_steps+1, self.num_environments)
-        self.intrinsic_values = torch.zeros(self.collection_steps+1, self.num_environments)
-        self.returns = torch.zeros(self.collection_steps, self.num_environments)
-        self.advantages = torch.zeros(self.collection_steps, self.num_environments)
-        self.intrinsic_ref_values = torch.zeros(self.collection_steps, self.num_environments)
-        self.extrinsic_ref_values = torch.zeros(self.collection_steps, self.num_environments)
+        self.curr_step = 0  # Track the current step
 
-        self.steps=0
+    def log_transition(self, observation, action_taken, rewards, done_flag, log_probability, ext_value, int_value):
+        """
+        Logs a single simulation transition into the buffer.
 
-    def store(self, obs, action, reward, done, log_prob, value_ext, value_int):
-        reward[0] = np.clip(reward[0], -10, 10)
-        reward[1] = np.clip(reward[1], -10, 10)
-        self.observations[self.steps] = torch.tensor(obs.copy())
-        self.actions[self.steps]= torch.tensor(action.copy())
-        self.ext_int_rewards[self.steps] = torch.tensor(reward.copy())
-        self.combined_ext_int_rewards[self.steps] = torch.tensor(reward.sum().copy())
-        self.dones[self.steps]= torch.tensor(done.copy())
-        self.action_log_probabilities[self.steps]= torch.tensor(log_prob.copy())
-        self.extrinsic_values[self.steps]= torch.tensor(value_ext.copy())
-        self.intrinsic_values[self.steps]= torch.tensor(value_int.copy())
+        Args:
+            observation (ndarray): The observation at the current step.
+            action_taken (ndarray): The action taken during this step.
+            rewards (ndarray): The intrinsic and extrinsic rewards.
+            done_flag (ndarray): Boolean flag indicating whether the episode is complete.
+            log_probability (ndarray): Log probability of the action.
+            ext_value (ndarray): Predicted extrinsic value.
+            int_value (ndarray): Predicted intrinsic value.
+        """
+        # Clipping rewards to ensure they stay within a reasonable range
+        rewards[0] = np.clip(rewards[0], -10, 10)
+        rewards[1] = np.clip(rewards[1], -10, 10)
+        
+        # Store data
+        self.obs_memory[self.curr_step] = torch.tensor(observation.copy())
+        self.action_memory[self.curr_step] = torch.tensor(action_taken.copy())
+        self.reward_split[self.curr_step] = torch.tensor(rewards.copy())
+        self.accumulated_rewards[self.curr_step] = torch.tensor(rewards.sum().copy())
+        self.termination_flags[self.curr_step] = torch.tensor(done_flag.copy())
+        self.action_log_probs[self.curr_step] = torch.tensor(log_probability.copy())
+        self.ext_value_estimations[self.curr_step] = torch.tensor(ext_value.copy())
+        self.int_value_estimations[self.curr_step] = torch.tensor(int_value.copy())
 
-        self.steps = (self.steps + 1) % self.collection_steps
+        # Move to next step
+        self.curr_step = (self.curr_step + 1) % self.total_steps
 
-    def store_last_state(self, obs, value_ext, value_int):
-        self.observations[-1] = torch.tensor(obs.copy())
-        self.extrinsic_values[-1]= torch.tensor(value_ext.copy())
-        self.intrinsic_values[-1]= torch.tensor(value_int.copy())
+    def save_final_state(self, observation, ext_value, int_value):
+        """
+        Logs the final state of the trajectory.
+        
+        Args:
+            observation (ndarray): The last observation in the trajectory.
+            ext_value (ndarray): The final extrinsic value estimate.
+            int_value (ndarray): The final intrinsic value estimate.
+        """
+        self.obs_memory[-1] = torch.tensor(observation.copy())
+        self.ext_value_estimations[-1] = torch.tensor(ext_value.copy())
+        self.int_value_estimations[-1] = torch.tensor(int_value.copy())
 
+    def calculate_advantages_and_returns(self, discount_factor=0.999, lambda_factor=0.95, normalize_advantages=True):
+        """
+        Compute the generalized advantages and returns from combined rewards (intrinsic + extrinsic).
 
-    def compute_combined_rewards_advantage(self, gamma=0.999, gae_lambda=0.95, advantages_norm=True):
-        reward_batch = self.combined_ext_int_rewards
-        for i in reversed(range(self.collection_steps - 1)):
-            reward = reward_batch[i]
-            done = self.dones[i]
-            value = self.intrinsic_values[i] + self.extrinsic_values[i]
-            next_value = self.intrinsic_values[i + 1] + self.extrinsic_values[i + 1]
+        Args:
+            discount_factor (float): Discount rate for future rewards.
+            lambda_factor (float): Smoothing parameter for GAE.
+            normalize_advantages (bool): Whether to normalize the calculated advantages.
+        """
+        rewards = self.accumulated_rewards
+        # Compute advantages in reverse using Generalized Advantage Estimation
+        for step in reversed(range(self.total_steps - 1)):
+            combined_value = self.int_value_estimations[step] + self.ext_value_estimations[step]
+            next_combined_value = self.int_value_estimations[step + 1] + self.ext_value_estimations[step + 1]
+            delta = rewards[step] + discount_factor * next_combined_value * (1 - self.termination_flags[step]) - combined_value
+            self.adv_estimations[step] = delta + discount_factor * lambda_factor * (1 - self.termination_flags[step]) * self.adv_estimations[step + 1]
 
-            delta = reward + gamma * next_value * (1 - done) - value
-            self.advantages[i] = delta + gamma * gae_lambda * (1 - done) * self.advantages[i + 1]
+        # Calculate future returns
+        self.future_returns = self.adv_estimations + (self.ext_value_estimations[:-1] + self.int_value_estimations[:-1])
 
-        self.returns = self.advantages + (self.extrinsic_values[:-1] + self.intrinsic_values[:-1])
-        if advantages_norm:
-            self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+        # Normalize advantages if specified
+        if normalize_advantages:
+            self.adv_estimations = (self.adv_estimations - self.adv_estimations.mean()) / (self.adv_estimations.std() + 1e-8)
 
-    def compute_intrinsic_and_extrinsic_reference_values(self,gamma=0.999, gae_lambda=0.95):
-        reward_ext_batch = self.ext_int_rewards[:,0]
-        reward_int_batch = self.ext_int_rewards[:,1]
-        ext = torch.zeros(self.collection_steps, self.num_environments)
-        int = torch.zeros(self.collection_steps, self.num_environments)
-        for i in reversed(range(self.collection_steps-1)):
-            extrinsics_reward = reward_ext_batch[i]
-            intrinsic_rewards = reward_int_batch[i]
-            done = self.dones[i]
+    def compute_reference_values(self, discount_factor=0.999, lambda_factor=0.95):
+        """
+        Compute reference values separately for intrinsic and extrinsic rewards.
 
-            extrinsic_value = self.extrinsic_values[i]
-            extrinsic_next_value = self.extrinsic_values[i + 1]
-            intrinsic_value = self.intrinsic_values[i]
-            intrinsic_next_value = self.intrinsic_values[i + 1]
+        Args:
+            discount_factor (float): Discount rate for future rewards.
+            lambda_factor (float): Smoothing parameter for GAE.
+        """
+        ext_rewards = self.reward_split[:, 0]
+        int_rewards = self.reward_split[:, 1]
+        extrinsic_buffer = torch.zeros(self.total_steps, self.sim_count)
+        intrinsic_buffer = torch.zeros(self.total_steps, self.sim_count)
+        
+        # Process extrinsic and intrinsic advantages separately
+        for step in reversed(range(self.total_steps - 1)):
+            delta_ext = ext_rewards[step] + discount_factor * self.ext_value_estimations[step + 1] * (1 - self.termination_flags[step]) - self.ext_value_estimations[step]
+            delta_int = int_rewards[step] + discount_factor * self.int_value_estimations[step + 1] * (1 - self.termination_flags[step]) - self.int_value_estimations[step]
 
-            delta_ext = extrinsics_reward + gamma * extrinsic_next_value * (1 - done) - extrinsic_value
-            delta_int = intrinsic_rewards + gamma * intrinsic_next_value * (1 - done) - intrinsic_value
+            extrinsic_buffer[step] = delta_ext + discount_factor * lambda_factor * (1 - self.termination_flags[step]) * extrinsic_buffer[step + 1]
+            intrinsic_buffer[step] = delta_int + discount_factor * lambda_factor * (1 - self.termination_flags[step]) * intrinsic_buffer[step + 1]
 
-            ext[i] = delta_ext + gamma * gae_lambda * (1 - done) * ext[i + 1]
-            int[i] = delta_int + gamma * gae_lambda * (1 - done) * int[i + 1]
+        self.ext_ref_vals = extrinsic_buffer + self.ext_value_estimations[:-1]
+        self.int_ref_vals = intrinsic_buffer + self.int_value_estimations[:-1]
 
-        self.extrinsic_ref_values = ext + self.extrinsic_values[:-1]
-        self.intrinsic_ref_values = int + self.intrinsic_values[:-1]
+    def sample_experiences(self, batch_total=None, mini_batch_size=None):
+        """
+        Samples experience batches from the buffer for training.
 
-    def gather_experience(self, batch_size=None, minimum_batch=None):
-        '''
-        Use the BatchSampler to sample a batch of experiences from the trajectory.
-        SubsetRandomSampler is used to shuffle the indices before sampling.
-        '''
-        sampler = BatchSampler(SubsetRandomSampler(range(batch_size)), minimum_batch, drop_last=True)
-        for idxs in sampler:
-            obs = torch.Tensor(self.observations[:-1]).reshape(-1, *self.observation_shape)[idxs]
-            actions = torch.Tensor(self.actions).reshape(-1)[idxs]
-            returns = torch.Tensor(self.returns).reshape(-1)[idxs]
-            advantages = torch.Tensor(self.advantages).reshape(-1)[idxs]
-            log_probs = torch.Tensor(self.action_log_probabilities).reshape(-1)[idxs]
-            ext_vals = torch.Tensor(self.extrinsic_ref_values).reshape(-1)[idxs]
-            int_vals = torch.Tensor(self.intrinsic_ref_values).reshape(-1)[idxs]
-            yield obs, actions, ext_vals,int_vals, returns, advantages, log_probs
+        Args:
+            batch_total (int): Total number of samples to extract from the buffer.
+            mini_batch_size (int): Size of the individual mini-batches returned.
+        """
+        sample_indices = BatchSampler(SubsetRandomSampler(range(batch_total)), mini_batch_size, drop_last=True)
+        for indices in sample_indices:
+            # Fetch sampled data by reshaping and indexing
+            obs_batch = torch.Tensor(self.obs_memory[:-1]).reshape(-1, *self.obs_dims)[indices]
+            actions_batch = torch.Tensor(self.action_memory).reshape(-1)[indices]
+            return_batch = torch.Tensor(self.future_returns).reshape(-1)[indices]
+            advantage_batch = torch.Tensor(self.adv_estimations).reshape(-1)[indices]
+            log_prob_batch = torch.Tensor(self.action_log_probs).reshape(-1)[indices]
+            ext_value_batch = torch.Tensor(self.ext_ref_vals).reshape(-1)[indices]
+            int_value_batch = torch.Tensor(self.int_ref_vals).reshape(-1)[indices]
+            
+            # Return the sampled data
+            yield obs_batch, actions_batch, ext_value_batch, int_value_batch, return_batch, advantage_batch, log_prob_batch
