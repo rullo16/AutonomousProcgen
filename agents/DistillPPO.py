@@ -217,8 +217,7 @@ class DistillPPOAgent:
     @torch.no_grad()
     def testing(self, game, test=True, viz=False, count=500):
         env = make_env(game,params=self.params, test=test, viz=viz, teacher_model=self.teacher, student_model=self.student, sum_rewards=False)
-        test_rewards = 0.0
-        test_steps = 0
+        test_rewards = []
         for _ in range(count):
             obs = env.reset()
             while True:
@@ -226,11 +225,10 @@ class DistillPPOAgent:
                 if test:
                     action = action[0]
                 obs, reward, done, _ = env.step(action)
-                test_rewards += reward[0]
-                test_steps += 1
+                test_rewards .append(reward[0])
                 if done:
                     break
-        return test_rewards / count, test_steps//count
+        return np.mean(test_rewards)
     
     '''
     Function used to improve the learning rate of the optimizer
@@ -255,7 +253,7 @@ class DistillPPOAgent:
 
         self.net.train()
         for _ in range(self.params.train_epochs):
-            samples = self.trajectories.sample_experiences(batch_size=batch, minimum_batch=self.minimum_batch_size)
+            samples = self.trajectories.sample_experiences(batch_total=batch, mini_batch_size=self.minimum_batch_size)
 
             for sample in samples:
                 observations, actions, old_extrinsic_values, old_intrinsic_values, returns, advantages, old_action_log_probabilities = sample

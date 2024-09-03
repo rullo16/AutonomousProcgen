@@ -10,6 +10,12 @@ import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 seed = 1
 
+
+'''
+Distillation Reward and Wrapper implemented following HandsOnDRL, 
+helps in integrating Distillation with a based PPO model without changing the code too much.
+'''
+
 @torch.no_grad()
 def distill_reward(obs,student_model = None, teacher_model = None):
     with torch.no_grad():
@@ -43,8 +49,6 @@ class DistillationRewardWrapper(gym.Wrapper):
             res_rewards  = np.array([reward, extra_reward * self.rewards_scale])
         return obs, res_rewards, done, info
 
-
-
 def make_env(game, n_envs=1,params=None, test=False, viz = False, student_model = None, teacher_model = None, sum_rewards=False):
     if test:
         env = gym.make(f'procgen:procgen-{game}-v0', start_level=seed, rand_seed = seed, distribution_mode='hard', render_mode='human' if viz else 'rgb_array')
@@ -54,6 +58,6 @@ def make_env(game, n_envs=1,params=None, test=False, viz = False, student_model 
         env = VecNormalize(env, ob=False)
         env = TransposeFrame(env)
         env = ScaledFloatFrame(env)
-    if params and params.name == 'distill':
+    if params:
         env = DistillationRewardWrapper(env,distill_reward,rewards_scale=params.distillation_scale, student_model = student_model, teacher_model = teacher_model, sum_rewards=sum_rewards)
     return env

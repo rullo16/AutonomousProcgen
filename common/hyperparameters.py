@@ -1,10 +1,9 @@
 from types import SimpleNamespace
 
 # Hyperparameters
-
 HYPERPARAMS = {
     'distill': SimpleNamespace(**{
-        'name' : 'distill',
+        'name' : 'distillation',
         'stop_reward': 10,
         'lr': 5e-4,
         'gamma': 0.999,
