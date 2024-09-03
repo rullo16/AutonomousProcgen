@@ -9,23 +9,6 @@ from common.env import make_env
 from common.trajectories import ExperienceBuffer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-'''
-Initialize weights of the network using xavier and orthogonal initialization
-This should be done for the distilled network as well as the network to be distilled
-and should yield better results than random initialization
-'''
-
-def xavier_init(module, scaling=1.0):
-    if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
-        nn.init.xavier_uniform_(module.weight.data, scaling)
-        nn.init.constant_(module.bias.data, 0)
-    return module
-
-def orthogonal_init(module, scaling=nn.init.calculate_gain('relu')):
-    if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
-        nn.init.orthogonal_(module.weight.data, scaling)
-        nn.init.constant_(module.bias.data, 0)
-    return module
 
 '''
 ImpalaBlock with Residual Connections, from the IMPALA Paper
@@ -82,19 +65,13 @@ class KnowledgeDistillationNetwork(nn.Module):
             nn.Dropout(0.5)
         )
 
-        conv_output_size = self._compute_conv_output(input_shape)
-
         self.fully_connected = nn.Sequential(
-            nn.Linear(conv_output_size, 256),
+            nn.Linear(8192, 256),
             nn.ReLU(),
             nn.Linear(256, 512),
             nn.ReLU(),
             nn.Linear(512, 1)
         )
-
-    def _compute_conv_output(self, shape):
-        output = self.convolutional_pipeline(torch.zeros(1, *shape))
-        return int(np.prod(output.size()))
     
     def forward(self, x):
         normalized_input = x.float() / 256
@@ -120,12 +97,8 @@ class PPOWithDistillation(nn.Module):
             nn.Dropout(0.5)
         )
 
-        self.convolution_pipeline.apply(xavier_init)
-
-        conv_output_size = self._compute_conv_output(obs_dims)
-
         self.actor_head = nn.Sequential(
-            nn.Linear(conv_output_size, 256),
+            nn.Linear(8192, 256),
             nn.ReLU(),
             nn.Linear(256, 512),
             nn.ReLU(),
@@ -133,25 +106,17 @@ class PPOWithDistillation(nn.Module):
         )
 
         self.critic_extrinsic = nn.Sequential(
-            nn.Linear(conv_output_size, 256),
+            nn.Linear(8192, 256),
             nn.Linear(256, 512),
             nn.ReLU(),
             nn.Linear(512, 1)
         )
 
         self.critic_intrinsic = nn.Sequential(
-            nn.Linear(conv_output_size, 256),
+            nn.Linear(8192, 256),
             nn.ReLU(),
             nn.Linear(256, 1)
         )
-    
-        self.actor_head.apply(orthogonal_init)
-        self.critic_extrinsic.apply(orthogonal_init)
-        self.critic_intrinsic.apply(orthogonal_init)
-        
-    def _compute_conv_output(self, shape):
-        output = self.convolution_pipeline(torch.zeros(1, *shape))
-        return int(np.prod(output.size()))
     
     def forward(self, x):
         normalized_input = x.float() / 256

@@ -12,7 +12,7 @@ seed = 1
 
 
 '''
-Distillation Reward and Wrapper implemented following HandsOnDRL, 
+Distillation Reward and Wrapper implemented following HandsOnDRL book instructions by Packt Publishing, 
 helps in integrating Distillation with a based PPO model without changing the code too much.
 '''
 
