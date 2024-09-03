@@ -8,6 +8,7 @@ from common.procgen_wrappers import *
 import torch
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+seed = 1
 
 @torch.no_grad()
 def distill_reward(obs,student_model = None, teacher_model = None):
@@ -46,9 +47,9 @@ class DistillationRewardWrapper(gym.Wrapper):
 
 def make_env(game, n_envs=1,params=None, test=False, viz = False, student_model = None, teacher_model = None, sum_rewards=False):
     if test:
-        env = gym.make(f'procgen:procgen-{game}-v0', num_levels=200, start_level=1, distribution_mode='easy', render_mode='human' if viz else 'rgb_array')
+        env = gym.make(f'procgen:procgen-{game}-v0', start_level=seed, rand_seed = seed, distribution_mode='hard', render_mode='human' if viz else 'rgb_array')
     else:
-        env = ProcgenEnv(num_envs=n_envs, env_name=game, num_levels=200, start_level=1, distribution_mode='easy')
+        env = ProcgenEnv(num_envs=n_envs, env_name=game, num_levels=200, start_level=seed, rand_seed=seed, distribution_mode='easy')
         env = VecExtractDictObs(env, "rgb")
         env = VecNormalize(env, ob=False)
         env = TransposeFrame(env)
